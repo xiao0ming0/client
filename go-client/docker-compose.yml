@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  go-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: server-monitor-dev
+    volumes:
+      # 映射项目代码到容器（包括bin目录，构建产物会直接保存到宿主机）
+      # 注意：整个项目目录已映射，bin目录中的构建产物会自动同步到宿主机
+      - .:/app
+      # 映射Go模块缓存（可选，加速构建）
+      - go-mod-cache:/go/pkg/mod
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    # 保持容器运行
+    command: /bin/sh
+    # 如果需要访问Docker（用于Docker监控功能），需要挂载Docker socket
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock  # Linux
+    #   - //var/run/docker.sock:/var/run/docker.sock  # Windows
+
+volumes:
+  go-mod-cache:
