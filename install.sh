@@ -11,21 +11,55 @@ fi
 UUID=$1
 URL="https://$2/api/v1/client/get"
 Client_ID=$3
-SERVICE_NAME="serverwatch.service"
-SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 
+# 检测操作系统类型
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    elif [ -f /etc/alpine-release ]; then
+        OS="alpine"
+    else
+        OS="unknown"
+    fi
+}
 
-# 检查服务是否已经存在
-if systemctl list-units --full -all | grep -Fq "$SERVICE_NAME"; then
-    echo "$SERVICE_NAME 已存在，删除旧的服务文件和服务..."
-    systemctl stop $SERVICE_NAME # 停止服务
-    systemctl disable $SERVICE_NAME # 禁用开机自启动
-    rm -f $SERVICE_PATH # 删除服务文件
-    systemctl daemon-reload # 重新加载 systemd 守护进程
+detect_os
+
+# 根据操作系统设置服务名称和路径
+if [ "$OS" = "alpine" ]; then
+    # Alpine Linux 使用 OpenRC
+    SERVICE_NAME="serverwatch"
+    SERVICE_PATH="/etc/init.d/$SERVICE_NAME"
+    INIT_SYSTEM="openrc"
+else
+    # Debian/Ubuntu 等使用 systemd
+    SERVICE_NAME="serverwatch.service"
+    SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
+    INIT_SYSTEM="systemd"
 fi
 
+echo "检测到系统: $OS, 使用 $INIT_SYSTEM 作为初始化系统"
 
-echo "创建 systemd 服务"
+# 停止并删除旧服务
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    # systemd 服务管理
+    if systemctl list-units --full -all 2>/dev/null | grep -Fq "$SERVICE_NAME"; then
+        echo "$SERVICE_NAME 已存在，删除旧的服务文件和服务..."
+        systemctl stop $SERVICE_NAME 2>/dev/null
+        systemctl disable $SERVICE_NAME 2>/dev/null
+        rm -f $SERVICE_PATH
+        systemctl daemon-reload 2>/dev/null
+    fi
+elif [ "$INIT_SYSTEM" = "openrc" ]; then
+    # OpenRC 服务管理
+    if [ -f "$SERVICE_PATH" ]; then
+        echo "$SERVICE_NAME 已存在，删除旧的服务文件和服务..."
+        rc-service $SERVICE_NAME stop 2>/dev/null
+        rc-update del $SERVICE_NAME 2>/dev/null
+        rm -f $SERVICE_PATH
+    fi
+fi
 
 # 使用 curl 获取 IP 地址（静默模式）
 ip=$(curl -s ifconfig.co)
@@ -41,8 +75,11 @@ else
     wget -O client --no-check-certificate --inet4-only "https://raw.githubusercontent.com/xinling123/client/refs/heads/main/client" >/dev/null 2>&1 && chmod +x client
 fi
 
-# 创建 systemd 服务单元文件
-bash -c "cat > $SERVICE_PATH" <<EOL
+# 根据初始化系统创建相应的服务文件
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    echo "创建 systemd 服务"
+    # 创建 systemd 服务单元文件
+    bash -c "cat > $SERVICE_PATH" <<EOL
 [Unit]
 Description=My Client Service
 After=network.target
@@ -54,21 +91,43 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOL
+    
+    # 重新加载 systemd 守护进程
+    systemctl daemon-reload
+    
+    # 启动服务
+    systemctl start $SERVICE_NAME
+    
+    # 设置服务为开机自动启动
+    systemctl enable $SERVICE_NAME
+    
+elif [ "$INIT_SYSTEM" = "openrc" ]; then
+    echo "创建 OpenRC 服务"
+    # 创建 OpenRC 服务脚本
+    bash -c "cat > $SERVICE_PATH" <<EOL
+#!/sbin/openrc-run
 
-# 重新加载 systemd 守护进程
-# echo "重新加载 systemd 守护进程..."
-systemctl daemon-reload
+name="serverwatch"
+description="My Client Service"
+command="/root/client"
+command_args="UUID=$UUID URL=$URL Client_ID=$Client_ID"
+pidfile="/var/run/\${RC_SVCNAME}.pid"
+command_background="yes"
 
-# 启动服务
-# echo "启动 $SERVICE_NAME..."
-systemctl start $SERVICE_NAME
-
-
-# 设置服务为开机自动启动
-# echo "设置 $SERVICE_NAME 开机自动启动..."
-systemctl enable $SERVICE_NAME
+depend() {
+    need net
+    after net
+}
+EOL
+    
+    # 设置执行权限
+    chmod +x $SERVICE_PATH
+    
+    # 启动服务
+    rc-service $SERVICE_NAME start
+    
+    # 设置服务为开机自动启动
+    rc-update add $SERVICE_NAME default
+fi
 
 echo "启动成功"
-
-
-
