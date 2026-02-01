@@ -38,6 +38,7 @@ const (
 	LOG_FILE_PATH           = "/root/server_watch.log"
 	MAX_LOG_SIZE            = 20 * 1024 * 1024 // 20 MB
 	BACKUP_COUNT            = 5
+	DOCKER_RETRY_INTERVAL   = 30               // 未安装/不可用时，每隔多少秒重试连接 Docker（秒）
 )
 
 // 配置结构
@@ -982,9 +983,12 @@ func dockerMonitor(ctx context.Context) {
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
 	
-	// 容器监控ticker
+	// 容器监控ticker（有 client 时每 3 秒采集）
 	containerTicker := time.NewTicker(3 * time.Second)
 	defer containerTicker.Stop()
+
+	var lastDockerRetry time.Time // 未安装 Docker 时，按 DOCKER_RETRY_INTERVAL 重试
+	var dockerRetryLogged bool    // 是否已打印过「Docker 不可用」的日志，避免重复刷屏
 
 	for {
 		select {
@@ -998,13 +1002,23 @@ func dockerMonitor(ctx context.Context) {
 			// 定期清理旧的网络历史数据
 			cleanupOldNetworkHistory()
 		case <-containerTicker.C:
-			// 若初次创建失败，定期重试
+			// 若尚无 client，按 DOCKER_RETRY_INTERVAL 重试，避免未安装 Docker 时频繁打日志
 			if cli == nil {
-				cli, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-				if err != nil {
-					logger.Printf("Retry create Docker client failed: %v", err)
+				if time.Since(lastDockerRetry) < time.Duration(DOCKER_RETRY_INTERVAL)*time.Second {
 					continue
 				}
+				lastDockerRetry = time.Now()
+				cli, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+				if err != nil {
+					// 仅首次失败时打印日志，避免反复刷屏
+					if !dockerRetryLogged {
+						logger.Printf("Docker client unavailable (will retry every %ds): %v", DOCKER_RETRY_INTERVAL, err)
+						dockerRetryLogged = true
+					}
+					continue
+				}
+				// 成功创建后，重置标志位以便下次失败时能再次提示
+				dockerRetryLogged = false
 			}
 
 			containers, err := cli.ContainerList(ctx, types.ContainerListOptions{All: true})
@@ -1013,6 +1027,7 @@ func dockerMonitor(ctx context.Context) {
 				// 连接可能已失效，关闭并重置以便下次重试
 				cli.Close()
 				cli = nil
+				dockerRetryLogged = false // 重置日志标志，下次创建失败时允许再次打印
 				continue
 			}
 
