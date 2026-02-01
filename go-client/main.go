@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -97,6 +98,10 @@ var (
 	// Docker网络统计历史数据
 	dockerNetworkHistory = make(map[string]map[string]interface{})
 	dockerNetworkMutex   = sync.RWMutex{}
+	
+	// 每个容器上次打印的 Docker 采集模式，用于仅在模式变化时打日志
+	dockerStatsModeLogged = make(map[string]string)
+	dockerStatsModeMutex  = sync.RWMutex{}
 	
 	logger *log.Logger
 	
@@ -778,6 +783,170 @@ func diskIOMonitor(ctx context.Context) {
 	}
 }
 
+// 辅助函数：读取文件内容并转为 uint64
+func readUint64FromFile(path string) (uint64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+}
+
+// 尝试从 Cgroup 读取数据 (支持 x86/ARM, Alpine/Ubuntu, Cgroup V1/V2)
+// 返回 false 表示读取失败，需回退到 API
+func collectStatsFromCgroup(containerID string, data map[string]interface{}) bool {
+	var (
+		cpuUsageTotal uint64
+		memUsage      uint64
+		pid           string
+	)
+
+	// -------------------------------------------------------
+	// 1. 内存与CPU读取 (兼容 V1 和 V2)
+	// -------------------------------------------------------
+
+	// === 尝试 Cgroup V2 (现代内核) ===
+	v2Paths := []string{
+		"/sys/fs/cgroup/system.slice/docker-" + containerID + ".scope", // Systemd
+		"/sys/fs/cgroup/docker/" + containerID,                         // Cgroupfs/Alpine
+		"/sys/fs/cgroup/" + containerID,                                // 根模式
+	}
+
+	isV2 := false
+	for _, p := range v2Paths {
+		if _, err := os.Stat(p + "/cpu.stat"); err == nil {
+			isV2 = true
+			// 读取 CPU (V2 单位是微秒，需转纳秒)
+			content, _ := os.ReadFile(p + "/cpu.stat")
+			lines := strings.Split(string(content), "\n")
+			for _, line := range lines {
+				if strings.HasPrefix(line, "usage_usec") {
+					fields := strings.Fields(line)
+					if len(fields) >= 2 {
+						val, _ := strconv.ParseUint(fields[1], 10, 64)
+						cpuUsageTotal = val * 1000
+					}
+					break
+				}
+			}
+			// 读取内存
+			memUsage, _ = readUint64FromFile(p + "/memory.current")
+			// 读取 PID
+			content, _ = os.ReadFile(p + "/cgroup.procs")
+			pids := strings.Fields(string(content))
+			if len(pids) > 0 {
+				pid = pids[len(pids)-1]
+			}
+			break
+		}
+	}
+
+	// === 尝试 Cgroup V1 (老内核/部分嵌入式) ===
+	if !isV2 {
+		v1CpuPaths := []string{
+			"/sys/fs/cgroup/cpu,cpuacct/docker/" + containerID,
+			"/sys/fs/cgroup/cpu,cpuacct/system.slice/docker-" + containerID + ".scope",
+		}
+
+		foundV1Cpu := false
+		for _, p := range v1CpuPaths {
+			if val, err := readUint64FromFile(p + "/cpuacct.usage"); err == nil {
+				cpuUsageTotal = val
+				foundV1Cpu = true
+				if content, err := os.ReadFile(p + "/tasks"); err == nil {
+					pids := strings.Fields(string(content))
+					if len(pids) > 0 {
+						pid = pids[len(pids)-1]
+					}
+				}
+				break
+			}
+		}
+
+		if !foundV1Cpu {
+			return false
+		}
+
+		v1MemPaths := []string{
+			"/sys/fs/cgroup/memory/docker/" + containerID,
+			"/sys/fs/cgroup/memory/system.slice/docker-" + containerID + ".scope",
+		}
+		for _, p := range v1MemPaths {
+			if val, err := readUint64FromFile(p + "/memory.usage_in_bytes"); err == nil {
+				memUsage = val
+				break
+			}
+		}
+	}
+
+	// -------------------------------------------------------
+	// 2. 网络流量读取 (基于 /proc/{pid}/net/dev)
+	// -------------------------------------------------------
+	rxBytes := uint64(0)
+	txBytes := uint64(0)
+
+	if pid != "" && runtime.GOOS == "linux" {
+		content, err := os.ReadFile(fmt.Sprintf("/proc/%s/net/dev", pid))
+		if err == nil {
+			lines := strings.Split(string(content), "\n")
+			for _, line := range lines {
+				if strings.Contains(line, "eth0") {
+					fields := strings.Fields(strings.ReplaceAll(line, ":", " "))
+					if len(fields) >= 10 {
+						rxBytes, _ = strconv.ParseUint(fields[1], 10, 64)
+						txBytes, _ = strconv.ParseUint(fields[9], 10, 64)
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// -------------------------------------------------------
+	// 3. 计算并更新 (复用原有逻辑)
+	// -------------------------------------------------------
+	currentTime := time.Now().Unix()
+	containerName, _ := data["name"].(string)
+
+	dockerNetworkMutex.Lock()
+	defer dockerNetworkMutex.Unlock()
+
+	data["cpu_usage"] = "0.00%"
+	data["memory_usage"] = memUsage
+	data["rx_speed"] = uint64(0)
+	data["tx_speed"] = uint64(0)
+
+	if history, exists := dockerNetworkHistory[containerName]; exists {
+		if lastTime, ok := history["time"].(int64); ok {
+			timeDiff := currentTime - lastTime
+
+			if lastCPU, ok := history["cpu_total"].(uint64); ok && timeDiff > 0 {
+				cpuDelta := cpuUsageTotal - lastCPU
+				sysDelta := uint64(timeDiff) * 1000000000 // 秒转纳秒
+				if sysDelta > 0 {
+					percent := float64(cpuDelta) / float64(sysDelta) * 100.0
+					data["cpu_usage"] = fmt.Sprintf("%.2f%%", percent)
+				}
+			}
+			if lastRx, ok := history["rx_bytes"].(uint64); ok {
+				if lastTx, ok := history["tx_bytes"].(uint64); ok && timeDiff > 0 {
+					data["rx_speed"] = (rxBytes - lastRx) / uint64(timeDiff)
+					data["tx_speed"] = (txBytes - lastTx) / uint64(timeDiff)
+				}
+			}
+		}
+	}
+
+	dockerNetworkHistory[containerName] = map[string]interface{}{
+		"time":      currentTime,
+		"rx_bytes":  rxBytes,
+		"tx_bytes":  txBytes,
+		"cpu_total": cpuUsageTotal,
+	}
+
+	return true
+}
+
 // 检查Docker是否安装
 func checkDockerInstalled() bool {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -801,6 +970,14 @@ func checkDockerInstalled() bool {
 func dockerMonitor(ctx context.Context) {
 	defer globalWaitGroup.Done()
 	
+	// 创建并重用 Docker Client，避免每次循环都建立新连接
+	var cli *client.Client
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		logger.Printf("Failed to create Docker client: %v (will retry on next tick)", err)
+		cli = nil
+	}
+	
 	// 创建一个用于清理历史数据的ticker
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
@@ -813,26 +990,29 @@ func dockerMonitor(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			logger.Println("Docker monitor stopping...")
+			if cli != nil {
+				cli.Close()
+			}
 			return
 		case <-cleanupTicker.C:
 			// 定期清理旧的网络历史数据
 			cleanupOldNetworkHistory()
 		case <-containerTicker.C:
-			if !checkDockerInstalled() {
-				// 错误已在checkDockerInstalled中记录
-				continue
-			}
-
-			cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-			if err != nil {
-				logger.Printf("Failed to create Docker client: %v", err)
-				continue
+			// 若初次创建失败，定期重试
+			if cli == nil {
+				cli, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+				if err != nil {
+					logger.Printf("Retry create Docker client failed: %v", err)
+					continue
+				}
 			}
 
 			containers, err := cli.ContainerList(ctx, types.ContainerListOptions{All: true})
 			if err != nil {
 				logger.Printf("Failed to list Docker containers: %v (permission issue or Docker API problem)", err)
+				// 连接可能已失效，关闭并重置以便下次重试
 				cli.Close()
+				cli = nil
 				continue
 			}
 
@@ -848,6 +1028,9 @@ func dockerMonitor(ctx context.Context) {
 			for containerName := range dockerStats {
 				if !currentContainers[containerName] {
 					delete(dockerStats, containerName)
+					dockerStatsModeMutex.Lock()
+					delete(dockerStatsModeLogged, containerName)
+					dockerStatsModeMutex.Unlock()
 					logger.Printf("Removed data for deleted container: %s", containerName)
 				}
 			}
@@ -906,11 +1089,11 @@ func dockerMonitor(ctx context.Context) {
 				// 所有容器处理完成
 			case <-ctx.Done():
 				// context已取消，不等待容器处理完成
-				cli.Close()
+				if cli != nil {
+					cli.Close()
+				}
 				return
 			}
-
-			cli.Close()
 		}
 	}
 }
@@ -922,13 +1105,36 @@ func collectSingleContainerData(cli *client.Client, container types.Container, c
 	containerData["status"] = container.State
 
 	if container.State == "running" {
+		// 策略 1: 极速模式 (Cgroup) - 优先尝试，ARM/Alpine 等直接读 cgroup，不走 API
+		if runtime.GOOS == "linux" && collectStatsFromCgroup(container.ID, containerData) {
+			dockerStatsModeMutex.Lock()
+			if dockerStatsModeLogged[containerName] != "Cgroup" {
+				logger.Printf("Docker stats [%s]: mode=Cgroup", containerName)
+				dockerStatsModeLogged[containerName] = "Cgroup"
+			}
+			dockerStatsModeMutex.Unlock()
+			return containerData
+		}
+
+		// 策略 2: 兜底模式 (Docker API) - Cgroup 读取失败时回退
+		fallbackReason := "Cgroup path not found"
+		if runtime.GOOS != "linux" {
+			fallbackReason = "non-Linux"
+		}
+		dockerStatsModeMutex.Lock()
+		if dockerStatsModeLogged[containerName] != "API" {
+			logger.Printf("Docker stats [%s]: mode=API, reason=%s", containerName, fallbackReason)
+			dockerStatsModeLogged[containerName] = "API"
+		}
+		dockerStatsModeMutex.Unlock()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
 		stats, err := cli.ContainerStats(ctx, container.ID, false)
 		if err == nil && stats.Body != nil {
 			defer stats.Body.Close()
-			
+
 			var statsData types.StatsJSON
 			decoder := json.NewDecoder(stats.Body)
 			decodeErr := decoder.Decode(&statsData)
@@ -966,10 +1172,8 @@ func collectSingleContainerData(cli *client.Client, container types.Container, c
 							if lastTx, ok := history["tx_bytes"].(uint64); ok {
 								timeDiff := currentTime - lastTime
 								if timeDiff > 0 {
-									rxSpeed := (currentRxBytes - lastRx) / uint64(timeDiff)
-									txSpeed := (currentTxBytes - lastTx) / uint64(timeDiff)
-									containerData["rx_speed"] = rxSpeed
-									containerData["tx_speed"] = txSpeed
+									containerData["rx_speed"] = (currentRxBytes - lastRx) / uint64(timeDiff)
+									containerData["tx_speed"] = (currentTxBytes - lastTx) / uint64(timeDiff)
 								} else {
 									containerData["rx_speed"] = uint64(0)
 									containerData["tx_speed"] = uint64(0)
@@ -982,11 +1186,12 @@ func collectSingleContainerData(cli *client.Client, container types.Container, c
 					containerData["tx_speed"] = uint64(0)
 				}
 
-				// 更新历史数据
+				// 更新历史数据，包含 cpu_total 以与 Cgroup 模式兼容
 				dockerNetworkHistory[containerName] = map[string]interface{}{
-					"time":     currentTime,
-					"rx_bytes": currentRxBytes,
-					"tx_bytes": currentTxBytes,
+					"time":      currentTime,
+					"rx_bytes":  currentRxBytes,
+					"tx_bytes":  currentTxBytes,
+					"cpu_total": statsData.CPUStats.CPUUsage.TotalUsage,
 				}
 				dockerNetworkMutex.Unlock()
 			} else {
@@ -1211,20 +1416,37 @@ func monitorVPS(config ClientConfig, priority, countryCode, emoji, ipv4, ipv6, s
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			
+			// 30 秒更新一次：启动时间、系统版本、CPU 型号、磁盘容量
+			var uptime, systemVersion, cpuModel string
+			var diskTotal, diskUsed uint64
+			var lastSlowUpdate time.Time
+			
+			// 10 秒更新一次：TCP、UDP、进程数、线程数
+			var tcp, udp, processes, threads int
+			var lastTUPDUpdate time.Time
+			
 			for {
 				select {
 				case <-ticker.C:
-					// 收集系统数据
-					uptime := getUptime()
-					systemVersion := getSystemVersion()
+					// 30 秒间隔：启动时间、系统版本、CPU 型号、磁盘
+					if time.Since(lastSlowUpdate) >= 30*time.Second {
+						uptime = getUptime()
+						systemVersion = getSystemVersion()
+						cpuModel = getCPUModel()
+						diskTotal, diskUsed = getDisk()
+						lastSlowUpdate = time.Now()
+					}
+					// 每秒采集
 					cpuUsage := getCPUUsage()
-					cpuModel := getCPUModel()
-					diskTotal, diskUsed := getDisk()
 					memoryTotal, memoryUsed := getMemory()
 					swapTotal, swapUsed := getSwap()
 					networkIn, networkOut := getNetwork()
 					loadAvg := getLoadAverage()
-					tcp, udp, processes, threads := getTUPD()
+					// 10 秒间隔：TCP、UDP、进程、线程
+					if time.Since(lastTUPDUpdate) >= 10*time.Second {
+						tcp, udp, processes, threads = getTUPD()
+						lastTUPDUpdate = time.Now()
+					}
 					
 					// 构建数据包
 					data := map[string]interface{}{
