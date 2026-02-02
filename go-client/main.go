@@ -1045,8 +1045,6 @@ func dockerMonitor(ctx context.Context) {
 					}
 					continue
 				}
-				// 成功创建后，重置标志位以便下次失败时能再次提示
-				dockerRetryLogged = false
 			}
 
 			containers, err := cli.ContainerList(ctx, types.ContainerListOptions{All: true})
