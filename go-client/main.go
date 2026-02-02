@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
@@ -103,6 +104,10 @@ var (
 	// 每个容器上次打印的 Docker 采集模式，用于仅在模式变化时打日志
 	dockerStatsModeLogged = make(map[string]string)
 	dockerStatsModeMutex  = sync.RWMutex{}
+
+	// 每个容器是否为 Host 网络模式的缓存，避免频繁 Inspect
+	containerHostNetworkCache = make(map[string]bool)
+	containerHostNetworkMutex = sync.RWMutex{}
 	
 	logger *log.Logger
 	
@@ -793,9 +798,31 @@ func readUint64FromFile(path string) (uint64, error) {
 	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 }
 
+// isContainerHostNetwork 检测容器是否使用 host 网络模式，结果会缓存
+func isContainerHostNetwork(cli *client.Client, ctx context.Context, containerID, containerName string) bool {
+	containerHostNetworkMutex.RLock()
+	if cached, ok := containerHostNetworkCache[containerName]; ok {
+		containerHostNetworkMutex.RUnlock()
+		return cached
+	}
+	containerHostNetworkMutex.RUnlock()
+
+	inspect, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return false
+	}
+	isHost := inspect.HostConfig != nil && container.NetworkMode(inspect.HostConfig.NetworkMode).IsHost()
+
+	containerHostNetworkMutex.Lock()
+	containerHostNetworkCache[containerName] = isHost
+	containerHostNetworkMutex.Unlock()
+	return isHost
+}
+
 // 尝试从 Cgroup 读取数据 (支持 x86/ARM, Alpine/Ubuntu, Cgroup V1/V2)
 // 返回 false 表示读取失败，需回退到 API
-func collectStatsFromCgroup(containerID string, data map[string]interface{}) bool {
+// isHostNetwork: 若为 true 则跳过网络读取（host 网络模式下 /proc/pid/net/dev 为宿主机数据，无法区分容器流量）
+func collectStatsFromCgroup(containerID string, data map[string]interface{}, isHostNetwork bool) bool {
 	var (
 		cpuUsageTotal uint64
 		memUsage      uint64
@@ -882,11 +909,12 @@ func collectStatsFromCgroup(containerID string, data map[string]interface{}) boo
 
 	// -------------------------------------------------------
 	// 2. 网络流量读取 (基于 /proc/{pid}/net/dev)
+	// Host 网络模式下容器共享宿主机网络栈，无法单独统计容器流量，故跳过
 	// -------------------------------------------------------
 	rxBytes := uint64(0)
 	txBytes := uint64(0)
 
-	if pid != "" && runtime.GOOS == "linux" {
+	if !isHostNetwork && pid != "" && runtime.GOOS == "linux" {
 		content, err := os.ReadFile(fmt.Sprintf("/proc/%s/net/dev", pid))
 		if err == nil {
 			lines := strings.Split(string(content), "\n")
@@ -1023,13 +1051,17 @@ func dockerMonitor(ctx context.Context) {
 
 			containers, err := cli.ContainerList(ctx, types.ContainerListOptions{All: true})
 			if err != nil {
-				logger.Printf("Failed to list Docker containers: %v (permission issue or Docker API problem)", err)
-				// 连接可能已失效，关闭并重置以便下次重试
+				// Docker 不可用时仅首次打印日志，并按 DOCKER_RETRY_INTERVAL 重试，避免刷屏
+				if !dockerRetryLogged {
+					logger.Printf("Docker unavailable (will retry every %ds): %v", DOCKER_RETRY_INTERVAL, err)
+					dockerRetryLogged = true
+				}
+				lastDockerRetry = time.Now()
 				cli.Close()
 				cli = nil
-				dockerRetryLogged = false // 重置日志标志，下次创建失败时允许再次打印
 				continue
 			}
+			dockerRetryLogged = false // 成功则重置，下次失败时允许再次打印
 
 			// 收集当前存在的容器名称
 			currentContainers := make(map[string]bool)
@@ -1046,6 +1078,9 @@ func dockerMonitor(ctx context.Context) {
 					dockerStatsModeMutex.Lock()
 					delete(dockerStatsModeLogged, containerName)
 					dockerStatsModeMutex.Unlock()
+					containerHostNetworkMutex.Lock()
+					delete(containerHostNetworkCache, containerName)
+					containerHostNetworkMutex.Unlock()
 					logger.Printf("Removed data for deleted container: %s", containerName)
 				}
 			}
@@ -1120,8 +1155,16 @@ func collectSingleContainerData(cli *client.Client, container types.Container, c
 	containerData["status"] = container.State
 
 	if container.State == "running" {
+		var isHostNetwork bool
+		if runtime.GOOS == "linux" {
+			// 检测是否为 Host 网络模式（结果会缓存），仅 Linux 下 Cgroup 模式需要
+			ctxInspect, cancelInspect := context.WithTimeout(context.Background(), 2*time.Second)
+			isHostNetwork = isContainerHostNetwork(cli, ctxInspect, container.ID, containerName)
+			cancelInspect()
+		}
+
 		// 策略 1: 极速模式 (Cgroup) - 优先尝试，ARM/Alpine 等直接读 cgroup，不走 API
-		if runtime.GOOS == "linux" && collectStatsFromCgroup(container.ID, containerData) {
+		if runtime.GOOS == "linux" && collectStatsFromCgroup(container.ID, containerData, isHostNetwork) {
 			dockerStatsModeMutex.Lock()
 			if dockerStatsModeLogged[containerName] != "Cgroup" {
 				logger.Printf("Docker stats [%s]: mode=Cgroup", containerName)
